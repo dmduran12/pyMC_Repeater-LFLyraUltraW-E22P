@@ -5,7 +5,7 @@ import sys
 
 from repeater.config import get_radio_for_board, load_config
 from repeater.engine import RepeaterHandler
-from repeater.http_server import HTTPStatsServer, _log_buffer
+from repeater.web.http_server import HTTPStatsServer, _log_buffer
 from pymc_core.node.handlers.trace import TraceHandler
 from pymc_core.protocol.constants import MAX_PATH_SIZE, ROUTE_TYPE_DIRECT
 
@@ -116,6 +116,13 @@ class RepeaterDaemon:
             )
             logger.info("Trace handler registered for network diagnostics")
 
+            allow_discovery = self.config.get("repeater", {}).get("allow_discovery", True)
+            if allow_discovery:
+                self._setup_discovery_handler()
+                logger.info("Discovery response handler enabled")
+            else:
+                logger.info("Discovery response handler disabled")
+
             
 
         except Exception as e:
@@ -194,7 +201,7 @@ class RepeaterDaemon:
                     "tx_delay_ms": 0,  
                     "transmitted": False,  
                     "is_duplicate": False,  
-                    "packet_hash": packet.calculate_packet_hash().hex()[:16],
+                    "packet_hash": packet.calculate_packet_hash().hex().upper()[:16],
                     "drop_reason": "trace_received",
                     "path_hash": path_hash,
                     "src_hash": None,  
@@ -205,6 +212,7 @@ class RepeaterDaemon:
                     "path_snrs": path_snrs,  # ["58(14.5dB)", "19(4.8dB)"]
                     "path_snr_details": path_snr_details,  # [{"hash": "29", "snr_raw": 58, "snr_db": 14.5}]
                     "is_trace": True,  
+                    "raw_packet": packet.write_to().hex() if hasattr(packet, "write_to") else None,
                 }
                 self.repeater_handler.log_trace_record(packet_record)
     
@@ -234,7 +242,7 @@ class RepeaterDaemon:
                 self.repeater_handler and not self.repeater_handler.is_duplicate(packet)):
                 
                 if self.repeater_handler and hasattr(self.repeater_handler, 'recent_packets'):
-                    packet_hash = packet.calculate_packet_hash().hex()[:16]
+                    packet_hash = packet.calculate_packet_hash().hex().upper()[:16]
                     for record in reversed(self.repeater_handler.recent_packets):
                         if record.get("packet_hash") == packet_hash:
                             record["transmitted"] = True
@@ -279,6 +287,79 @@ class RepeaterDaemon:
 
         except Exception as e:
             logger.error(f"[TraceHandler] Error processing trace packet: {e}")
+
+    def _setup_discovery_handler(self):
+        """Set up discovery request/response handling."""
+        try:
+            from pymc_core.node.handlers.control import ControlHandler
+            
+            self.control_handler = ControlHandler(log_fn=logger.info)
+            self.dispatcher.register_handler(
+                ControlHandler.payload_type(),
+                self._control_callback,
+            )
+
+            # Node type 2 = Repeater
+            node_type = 2
+            
+            def on_discovery_request(request_data: dict):
+                """Handle incoming discovery request."""
+                try:
+                    tag = request_data.get("tag", 0)
+                    filter_byte = request_data.get("filter", 0)
+                    prefix_only = request_data.get("prefix_only", False)
+                    snr = request_data.get("snr", 0.0)
+                    rssi = request_data.get("rssi", 0)
+
+                    logger.info(f"[Discovery] Request: tag=0x{tag:08X}, filter=0x{filter_byte:02X}, SNR={snr:+.1f}dB, RSSI={rssi}dBm")
+
+                    # Check if filter matches our node type (repeater = 2, filter_mask = 0x04)
+                    filter_mask = 1 << node_type  # 1 << 2 = 0x04
+                    if (filter_byte & filter_mask) == 0:
+                        logger.debug("[Discovery] Filter doesn't match, ignoring")
+                        return
+
+                    logger.info("[Discovery] Sending response...")
+                    
+                    if self.local_identity:
+                        our_pub_key = self.local_identity.get_public_key()
+                        
+                        from pymc_core.protocol.packet_builder import PacketBuilder
+                        response_packet = PacketBuilder.create_discovery_response(
+                            tag=tag,
+                            node_type=node_type,
+                            inbound_snr=snr,
+                            pub_key=our_pub_key,
+                            prefix_only=prefix_only,
+                        )
+
+                        # Send response asynchronously
+                        asyncio.create_task(self._send_discovery_response(response_packet, tag))
+                    else:
+                        logger.warning("[Discovery] No local identity available for response")
+
+                except Exception as e:
+                    logger.error(f"[Discovery] Error handling request: {e}")
+
+            self.control_handler.set_request_callback(on_discovery_request)
+            logger.debug("[Discovery] Handler registered")
+
+        except Exception as e:
+            logger.error(f"Failed to setup discovery handler: {e}")
+
+    async def _control_callback(self, packet):
+        if self.control_handler:
+            await self.control_handler(packet)
+
+    async def _send_discovery_response(self, packet, tag):
+        try:
+            success = await self.dispatcher.send_packet(packet, wait_for_ack=False)
+            if success:
+                logger.info(f"[Discovery] Response sent for tag 0x{tag:08X}")
+            else:
+                logger.warning(f"[Discovery] Failed to send response for tag 0x{tag:08X}")
+        except Exception as e:
+            logger.error(f"[Discovery] Error sending response: {e}")
 
 
 
@@ -350,7 +431,6 @@ class RepeaterDaemon:
         http_port = self.config.get("http", {}).get("port", 8000)
         http_host = self.config.get("http", {}).get("host", "0.0.0.0")
 
-        template_dir = os.path.join(os.path.dirname(__file__), "templates")
         node_name = self.config.get("repeater", {}).get("node_name", "Repeater")
 
         # Format public key for display
@@ -369,7 +449,6 @@ class RepeaterDaemon:
             host=http_host,
             port=http_port,
             stats_getter=self.get_stats,
-            template_dir=template_dir,
             node_name=node_name,
             pub_key=pub_key_formatted,
             send_advert_func=self.send_advert,
